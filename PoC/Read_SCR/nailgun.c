@@ -126,11 +126,15 @@ static void read_scr(void *addr) {
     iowrite32(0x0, param->debug_register + OSLAR_OFFSET);
     iowrite32(0x0, param->cti_register + OSLAR_OFFSET);
 
+    // TODO: Read the lock status register DBGLSR
+
     // Step 2: Enable halting debug on the target processor
     printk(KERN_INFO "Step 2: Enable halting debug\n");
     reg = ioread32(param->debug_register + EDSCR_OFFSET);
     reg |= HDE;
     iowrite32(reg, param->debug_register + EDSCR_OFFSET);
+
+    // TODO: Enable DBGSCR execute instruction enable bit (13)
 
     // Step 3: Send halt request to the target processor
     printk(KERN_INFO "Step 3: Halt the target processor\n");
